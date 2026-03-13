@@ -122,6 +122,66 @@ export type CreatedTitleProject = {
   endScale: number;
 };
 
+export type StoryboardSegmentInput = {
+  text: string;
+  durationSeconds: number;
+  effectPreset?: TitleEffectPreset | string;
+  fontName?: string;
+  fontSize?: number;
+  startScale?: number;
+  endScale?: number;
+  positionX?: number;
+  positionY?: number;
+};
+
+export type CreateStoryboardProjectOptions = {
+  segments: StoryboardSegmentInput[];
+  libraryPath?: string;
+  eventName?: string;
+  projectName?: string;
+  defaultFontName?: string;
+  defaultFontSize?: number;
+};
+
+export type CreatedStoryboardProject = {
+  imported: true;
+  app: AppInfo;
+  libraryPath: string;
+  eventName: string;
+  projectName: string;
+  eventPath: string;
+  projectPath: string;
+  segmentCount: number;
+  totalDurationSeconds: number;
+  fcpxmlPath: string;
+  segments: Array<{
+    text: string;
+    durationSeconds: number;
+    effectPreset: TitleEffectPreset;
+    fontName: string;
+    fontSize: number;
+    startScale: number;
+    endScale: number;
+    positionX: number;
+    positionY: number;
+  }>;
+};
+
+export type DoctorCheck = {
+  key: string;
+  ok: boolean;
+  detail: string;
+};
+
+export type DoctorReport = {
+  checkedAt: string;
+  app: AppInfo | null;
+  libraryPath: string | null;
+  checks: DoctorCheck[];
+  libraries: LibrarySummary[];
+  allOk: boolean;
+};
+
 export class FinalCutError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
@@ -221,6 +281,50 @@ function normalizeEffectPreset(value: string | undefined): TitleEffectPreset {
   }
 }
 
+function normalizeOptionalNumber(value: unknown, fallback: number): number {
+  if (typeof value !== "number") {
+    return fallback;
+  }
+
+  if (!Number.isFinite(value)) {
+    throw new FinalCutError(`Expected a finite number, received: ${value}`);
+  }
+
+  return value;
+}
+
+function normalizePositiveNumber(value: unknown, fallback: number, fieldName: string): number {
+  const normalized = normalizeOptionalNumber(value, fallback);
+  if (normalized <= 0) {
+    throw new FinalCutError(`${fieldName} must be a positive number.`);
+  }
+
+  return normalized;
+}
+
+function normalizeText(value: string, fieldName: string): string {
+  const text = value.trim();
+  if (!text) {
+    throw new FinalCutError(`${fieldName} cannot be empty.`);
+  }
+
+  return text;
+}
+
+function formatNumber(value: number): string {
+  const rounded = Math.round(value * 1000) / 1000;
+  const asString = String(rounded);
+  return asString.includes(".") ? asString.replace(/0+$/g, "").replace(/\.$/, "") : asString;
+}
+
+function formatSeconds(seconds: number): string {
+  return `${formatNumber(seconds)}s`;
+}
+
+function isDifferent(left: number, right: number): boolean {
+  return Math.abs(left - right) > 0.0001;
+}
+
 function fileStem(value: string): string {
   const stem = value
     .replace(/[^A-Za-z0-9._-]+/g, "-")
@@ -312,6 +416,113 @@ async function projectExists(libraryPath: string, eventName: string, projectName
   return exists(join(libraryPath, eventName, projectName));
 }
 
+type NormalizedStoryboardSegment = {
+  text: string;
+  durationSeconds: number;
+  effectPreset: TitleEffectPreset;
+  fontName: string;
+  fontSize: number;
+  startScale: number;
+  endScale: number;
+  positionX: number;
+  positionY: number;
+};
+
+function buildEffectResources(effectPresets: TitleEffectPreset[]): {
+  resourceXml: string;
+  effectResourceIdByPreset: Record<TitleEffectPreset, string>;
+} {
+  const effectResourceIdByPreset = {} as Record<TitleEffectPreset, string>;
+  const seen = new Set<TitleEffectPreset>();
+  const uniquePresets: TitleEffectPreset[] = [];
+
+  for (const preset of effectPresets) {
+    if (seen.has(preset)) {
+      continue;
+    }
+
+    seen.add(preset);
+    uniquePresets.push(preset);
+  }
+
+  const resourceXml = uniquePresets
+    .map((preset, index) => {
+      const effectResourceId = `r${index + 2}`;
+      effectResourceIdByPreset[preset] = effectResourceId;
+      const effect = TITLE_EFFECTS[preset];
+      return `    <effect id="${effectResourceId}" name="${xmlEscape(effect.name)}" uid="${xmlEscape(effect.uid)}"/>`;
+    })
+    .join("\n");
+
+  return {
+    resourceXml,
+    effectResourceIdByPreset,
+  };
+}
+
+function buildTransformBlock(options: {
+  durationSeconds: number;
+  startScale: number;
+  endScale: number;
+  force: boolean;
+}): string {
+  const includeTransform = options.force || isDifferent(options.startScale, 1) || isDifferent(options.endScale, 1);
+  if (!includeTransform) {
+    return "";
+  }
+
+  const duration = formatSeconds(options.durationSeconds);
+  const startScale = `${formatNumber(options.startScale)} ${formatNumber(options.startScale)}`;
+  const endScale = `${formatNumber(options.endScale)} ${formatNumber(options.endScale)}`;
+
+  return `
+            <adjust-transform scale="${startScale}">
+              <param name="Scale" key="scale" value="${startScale}">
+                <keyframeAnimation>
+                  <keyframe time="0s" value="${startScale}"/>
+                  <keyframe time="${duration}" value="${endScale}"/>
+                </keyframeAnimation>
+              </param>
+            </adjust-transform>`;
+}
+
+function buildTitleNodeXml(options: {
+  name: string;
+  offsetSeconds: number;
+  durationSeconds: number;
+  effectResourceId: string;
+  textStyleId: string;
+  text: string;
+  fontName: string;
+  fontSize: number;
+  positionX: number;
+  positionY: number;
+  startScale: number;
+  endScale: number;
+  forceScaleTransform: boolean;
+}): string {
+  const offset = formatSeconds(options.offsetSeconds);
+  const duration = formatSeconds(options.durationSeconds);
+  const position = `${formatNumber(options.positionX)} ${formatNumber(options.positionY)}`;
+  const transformBlock = buildTransformBlock({
+    durationSeconds: options.durationSeconds,
+    startScale: options.startScale,
+    endScale: options.endScale,
+    force: options.forceScaleTransform,
+  });
+
+  return `          <title name="${xmlEscape(options.name)}" offset="${offset}" ref="${options.effectResourceId}" duration="${duration}" start="0s">
+            <param name="Position" key="9999/10199/10201/1/100/101" value="${position}"/>
+            <text>
+              <text-style ref="${options.textStyleId}">${xmlEscape(options.text)}</text-style>
+            </text>
+            <text-style-def id="${options.textStyleId}">
+              <text-style font="${xmlEscape(options.fontName)}" fontSize="${options.fontSize}" fontFace="Regular" fontColor="1 1 1 1" alignment="center"/>
+            </text-style-def>
+${transformBlock}
+          </title>`;
+}
+
 function buildTitleProjectFcpxml(options: {
   libraryPath: string;
   eventName: string;
@@ -324,22 +535,26 @@ function buildTitleProjectFcpxml(options: {
   startScale: number;
   endScale: number;
 }): string {
-  const effect = TITLE_EFFECTS[options.effectPreset];
   const libraryUrl = pathToFileURL(options.libraryPath).href;
-  const duration = `${options.durationSeconds}s`;
-  const startScale = `${options.startScale} ${options.startScale}`;
-  const endScale = `${options.endScale} ${options.endScale}`;
-  const transformBlock = effect.usesTransform
-    ? `
-            <adjust-transform scale="${startScale}">
-              <param name="Scale" key="scale" value="${startScale}">
-                <keyframeAnimation>
-                  <keyframe time="0s" value="${startScale}"/>
-                  <keyframe time="${duration}" value="${endScale}"/>
-                </keyframeAnimation>
-              </param>
-            </adjust-transform>`
-    : "";
+  const duration = formatSeconds(options.durationSeconds);
+  const effect = TITLE_EFFECTS[options.effectPreset];
+  const resources = buildEffectResources([options.effectPreset]);
+  const effectResourceId = resources.effectResourceIdByPreset[options.effectPreset];
+  const titleNode = buildTitleNodeXml({
+    name: "Start Title",
+    offsetSeconds: 0,
+    durationSeconds: options.durationSeconds,
+    effectResourceId,
+    textStyleId: "ts1",
+    text: options.text,
+    fontName: options.fontName,
+    fontSize: options.fontSize,
+    positionX: 0,
+    positionY: 0,
+    startScale: options.startScale,
+    endScale: options.endScale,
+    forceScaleTransform: effect.usesTransform,
+  });
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE fcpxml>
@@ -350,28 +565,127 @@ function buildTitleProjectFcpxml(options: {
   </import-options>
   <resources>
     <format id="r1" name="FFVideoFormat1080p30" frameDuration="1/30s" width="1920" height="1080" colorSpace="1-1-1 (Rec. 709)"/>
-    <effect id="r2" name="${xmlEscape(effect.name)}" uid="${xmlEscape(effect.uid)}"/>
+${resources.resourceXml}
   </resources>
   <event name="${xmlEscape(options.eventName)}">
     <project name="${xmlEscape(options.projectName)}">
       <sequence format="r1" duration="${duration}" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
         <spine>
-          <title name="Start Title" offset="0s" ref="r2" duration="${duration}" start="0s">
-            <param name="Position" key="9999/10199/10201/1/100/101" value="0 0"/>
-            <text>
-              <text-style ref="ts1">${xmlEscape(options.text)}</text-style>
-            </text>
-            <text-style-def id="ts1">
-              <text-style font="${xmlEscape(options.fontName)}" fontSize="${options.fontSize}" fontFace="Regular" fontColor="1 1 1 1" alignment="center"/>
-            </text-style-def>
-${transformBlock}
-          </title>
+${titleNode}
         </spine>
       </sequence>
     </project>
   </event>
 </fcpxml>
 `;
+}
+
+function normalizeStoryboardSegments(
+  segments: StoryboardSegmentInput[],
+  defaultFontName: string,
+  defaultFontSize: number,
+): NormalizedStoryboardSegment[] {
+  if (!Array.isArray(segments) || segments.length === 0) {
+    throw new FinalCutError("At least one storyboard segment is required.");
+  }
+
+  return segments.map((segment, index) => {
+    const label = `segments[${index}]`;
+    const text = normalizeText(segment.text, `${label}.text`);
+    const durationSeconds = normalizePositiveNumber(segment.durationSeconds, 2, `${label}.durationSeconds`);
+    const effectPreset = normalizeEffectPreset(segment.effectPreset);
+    const fontName = normalizeName(segment.fontName, defaultFontName);
+    const fontSize = normalizePositiveNumber(segment.fontSize, defaultFontSize, `${label}.fontSize`);
+    const startScale = normalizePositiveNumber(
+      segment.startScale,
+      effectPreset === "basic" ? 0.95 : 1,
+      `${label}.startScale`,
+    );
+    const endScale = normalizePositiveNumber(
+      segment.endScale,
+      effectPreset === "basic" ? 1.05 : 1,
+      `${label}.endScale`,
+    );
+    const positionX = normalizeOptionalNumber(segment.positionX, 0);
+    const positionY = normalizeOptionalNumber(segment.positionY, 0);
+
+    return {
+      text,
+      durationSeconds,
+      effectPreset,
+      fontName,
+      fontSize,
+      startScale,
+      endScale,
+      positionX,
+      positionY,
+    };
+  });
+}
+
+function buildStoryboardProjectFcpxml(options: {
+  libraryPath: string;
+  eventName: string;
+  projectName: string;
+  segments: NormalizedStoryboardSegment[];
+}): {
+  fcpxml: string;
+  totalDurationSeconds: number;
+} {
+  const libraryUrl = pathToFileURL(options.libraryPath).href;
+  const presets = options.segments.map((segment) => segment.effectPreset);
+  const resources = buildEffectResources(presets);
+  const totalDurationSeconds = options.segments.reduce((sum, segment) => sum + segment.durationSeconds, 0);
+  const timelineDuration = formatSeconds(totalDurationSeconds);
+
+  let cursor = 0;
+  const titleNodes = options.segments.map((segment, index) => {
+    const titleXml = buildTitleNodeXml({
+      name: `Segment ${index + 1}`,
+      offsetSeconds: cursor,
+      durationSeconds: segment.durationSeconds,
+      effectResourceId: resources.effectResourceIdByPreset[segment.effectPreset],
+      textStyleId: `ts${index + 1}`,
+      text: segment.text,
+      fontName: segment.fontName,
+      fontSize: segment.fontSize,
+      positionX: segment.positionX,
+      positionY: segment.positionY,
+      startScale: segment.startScale,
+      endScale: segment.endScale,
+      forceScaleTransform: TITLE_EFFECTS[segment.effectPreset].usesTransform,
+    });
+    cursor += segment.durationSeconds;
+    return titleXml;
+  });
+
+  const fcpxml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.13">
+  <import-options>
+    <option key="library location" value="${xmlEscape(libraryUrl)}"/>
+    <option key="suppress warnings" value="1"/>
+  </import-options>
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p30" frameDuration="1/30s" width="1920" height="1080" colorSpace="1-1-1 (Rec. 709)"/>
+${resources.resourceXml}
+  </resources>
+  <event name="${xmlEscape(options.eventName)}">
+    <project name="${xmlEscape(options.projectName)}">
+      <sequence format="r1" duration="${timelineDuration}" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+        <spine>
+${titleNodes.join("\n")}
+        </spine>
+      </sequence>
+    </project>
+  </event>
+</fcpxml>
+`;
+
+  return {
+    fcpxml,
+    totalDurationSeconds,
+  };
 }
 
 async function waitForPath(path: string, timeoutMs = 20_000): Promise<boolean> {
@@ -388,6 +702,39 @@ async function waitForPath(path: string, timeoutMs = 20_000): Promise<boolean> {
   }
 
   return false;
+}
+
+async function importGeneratedProject(options: {
+  app: AppInfo;
+  libraryPath: string;
+  eventName: string;
+  projectName: string;
+  fcpxml: string;
+}): Promise<{
+  fcpxmlPath: string;
+  eventPath: string;
+  projectPath: string;
+}> {
+  const tempDirectory = await mkdtemp(join(tmpdir(), "final-cut-pro-mcp-"));
+  const fcpxmlPath = join(tempDirectory, `${fileStem(options.projectName)}.fcpxml`);
+  await writeFile(fcpxmlPath, options.fcpxml, "utf8");
+  await execTextFile("open", ["-a", options.app.appPath], 8_000);
+  await importFcpxml(fcpxmlPath);
+
+  const eventPath = join(options.libraryPath, options.eventName);
+  const projectPath = join(eventPath, options.projectName);
+  const created = await waitForPath(projectPath);
+  if (!created) {
+    throw new FinalCutError(
+      `Final Cut Pro import started but the created project was not detected in ${options.libraryPath}. Check the app for an import error dialog.`,
+    );
+  }
+
+  return {
+    fcpxmlPath,
+    eventPath,
+    projectPath,
+  };
 }
 
 export async function getAppInfo(): Promise<AppInfo> {
@@ -436,15 +783,8 @@ export async function importFcpxml(inputPath: string): Promise<{
 }
 
 export async function createTitleProject(options: CreateTitleProjectOptions): Promise<CreatedTitleProject> {
-  const text = options.text.trim();
-  if (!text) {
-    throw new FinalCutError("Text is required to create a title project.");
-  }
-
-  const durationSeconds = options.durationSeconds ?? 5;
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    throw new FinalCutError("durationSeconds must be a positive number.");
-  }
+  const text = normalizeText(options.text, "text");
+  const durationSeconds = normalizePositiveNumber(options.durationSeconds, 5, "durationSeconds");
 
   const app = await getAppInfo();
   const libraryPath = await resolveLibraryPath(options.libraryPath);
@@ -463,12 +803,9 @@ export async function createTitleProject(options: CreateTitleProjectOptions): Pr
 
   const effectPreset = normalizeEffectPreset(options.effectPreset);
   const fontName = normalizeName(options.fontName, "Helvetica");
-  const fontSize = options.fontSize ?? 96;
-  const startScale = options.startScale ?? 0.8;
-  const endScale = options.endScale ?? 1.2;
-
-  const tempDirectory = await mkdtemp(join(tmpdir(), "final-cut-pro-mcp-"));
-  const fcpxmlPath = join(tempDirectory, `${fileStem(projectName)}.fcpxml`);
+  const fontSize = normalizePositiveNumber(options.fontSize, 96, "fontSize");
+  const startScale = normalizePositiveNumber(options.startScale, 0.8, "startScale");
+  const endScale = normalizePositiveNumber(options.endScale, 1.2, "endScale");
   const fcpxml = buildTitleProjectFcpxml({
     libraryPath,
     eventName,
@@ -481,20 +818,13 @@ export async function createTitleProject(options: CreateTitleProjectOptions): Pr
     startScale,
     endScale,
   });
-
-  await writeFile(fcpxmlPath, fcpxml, "utf8");
-  await execTextFile("open", ["-a", app.appPath], 8_000);
-  await importFcpxml(fcpxmlPath);
-
-  const eventPath = join(libraryPath, eventName);
-  const projectPath = join(eventPath, projectName);
-
-  const created = await waitForPath(projectPath);
-  if (!created) {
-    throw new FinalCutError(
-      `Final Cut Pro import started but the created project was not detected in ${libraryPath}. Check the app for an import error dialog.`,
-    );
-  }
+  const importedProject = await importGeneratedProject({
+    app,
+    libraryPath,
+    eventName,
+    projectName,
+    fcpxml,
+  });
 
   return {
     imported: true,
@@ -502,14 +832,63 @@ export async function createTitleProject(options: CreateTitleProjectOptions): Pr
     libraryPath,
     eventName,
     projectName,
-    eventPath,
-    projectPath,
+    eventPath: importedProject.eventPath,
+    projectPath: importedProject.projectPath,
     durationSeconds,
     text,
-    fcpxmlPath,
+    fcpxmlPath: importedProject.fcpxmlPath,
     effectPreset,
     startScale,
     endScale,
+  };
+}
+
+export async function createStoryboardProject(options: CreateStoryboardProjectOptions): Promise<CreatedStoryboardProject> {
+  const app = await getAppInfo();
+  const libraryPath = await resolveLibraryPath(options.libraryPath);
+  const defaultFontName = normalizeName(options.defaultFontName, "Helvetica");
+  const defaultFontSize = normalizePositiveNumber(options.defaultFontSize, 96, "defaultFontSize");
+  const segments = normalizeStoryboardSegments(options.segments, defaultFontName, defaultFontSize);
+  const eventBaseName = normalizeName(options.eventName, `AI Story Event ${timestampSlug()}`);
+  const projectBaseName = normalizeName(options.projectName, `AI Story ${timestampSlug()}`);
+  const eventRequested = options.eventName !== undefined;
+  const projectRequested = options.projectName !== undefined;
+  const eventName = eventRequested ? eventBaseName : await uniqueEventName(libraryPath, eventBaseName);
+  const projectName = projectRequested ? projectBaseName : await uniqueProjectName(libraryPath, eventName, projectBaseName);
+
+  if (eventRequested && projectRequested && (await projectExists(libraryPath, eventName, projectName))) {
+    throw new FinalCutError(
+      `Project already exists: ${join(libraryPath, eventName, projectName)}. Reuse it or delete it before creating the same named project again.`,
+    );
+  }
+
+  const storyboard = buildStoryboardProjectFcpxml({
+    libraryPath,
+    eventName,
+    projectName,
+    segments,
+  });
+
+  const importedProject = await importGeneratedProject({
+    app,
+    libraryPath,
+    eventName,
+    projectName,
+    fcpxml: storyboard.fcpxml,
+  });
+
+  return {
+    imported: true,
+    app,
+    libraryPath,
+    eventName,
+    projectName,
+    eventPath: importedProject.eventPath,
+    projectPath: importedProject.projectPath,
+    segmentCount: segments.length,
+    totalDurationSeconds: storyboard.totalDurationSeconds,
+    fcpxmlPath: importedProject.fcpxmlPath,
+    segments,
   };
 }
 
@@ -613,6 +992,101 @@ try {
   return {
     app,
     libraries: response.libraries,
+  };
+}
+
+export async function runDoctor(options: {
+  libraryPath?: string;
+} = {}): Promise<DoctorReport> {
+  const checks: DoctorCheck[] = [];
+  const libraries: LibrarySummary[] = [];
+  const checkedAt = new Date().toISOString();
+
+  let app: AppInfo | null = null;
+  try {
+    app = await getAppInfo();
+    checks.push({
+      key: "app-detected",
+      ok: true,
+      detail: `${app.appName} ${app.version} (${app.appPath})`,
+    });
+  } catch (error) {
+    checks.push({
+      key: "app-detected",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (app) {
+    const sdefExists = await exists(app.scriptingDefinitionPath);
+    checks.push({
+      key: "sdef-present",
+      ok: sdefExists,
+      detail: sdefExists
+        ? `Scripting definition found: ${app.scriptingDefinitionPath}`
+        : `Scripting definition not found: ${app.scriptingDefinitionPath}`,
+    });
+  }
+
+  let libraryPath: string | null = null;
+  try {
+    libraryPath = await resolveLibraryPath(options.libraryPath);
+    checks.push({
+      key: "library-path",
+      ok: true,
+      detail: `Library path resolved: ${libraryPath}`,
+    });
+  } catch (error) {
+    checks.push({
+      key: "library-path",
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  if (libraryPath) {
+    try {
+      await access(libraryPath, fsConstants.W_OK);
+      checks.push({
+        key: "library-write",
+        ok: true,
+        detail: `Writable library: ${libraryPath}`,
+      });
+    } catch (error) {
+      checks.push({
+        key: "library-write",
+        ok: false,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  if (app) {
+    try {
+      const inspected = await inspectLibraries();
+      libraries.push(...inspected.libraries);
+      checks.push({
+        key: "automation-read",
+        ok: true,
+        detail: summarizeLibraries(inspected.libraries),
+      });
+    } catch (error) {
+      checks.push({
+        key: "automation-read",
+        ok: false,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {
+    checkedAt,
+    app,
+    libraryPath,
+    checks,
+    libraries,
+    allOk: checks.every((check) => check.ok),
   };
 }
 
