@@ -17,7 +17,7 @@ import {
 
 const server = new McpServer({
   name: "final-cut-pro-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 server.registerTool(
